@@ -4,6 +4,7 @@ const cors = require('cors');
 const multer = require('multer');
 const fs = require('fs');
 const csv = require('csv-parser');
+const ss = require('simple-statistics'); // Math library
 const db = require('./db');
 const { categorizeTransaction } = require('./aiService');
 
@@ -26,7 +27,7 @@ app.post('/api/upload', upload.single('statement'), (req, res) => {
         .on('data', (data) => results.push(data))
         .on('end', async () => {
             try {
-                // Clear old data for a fresh demo
+                // Clear old data for demo purposes
                 await db.query('DELETE FROM transactions WHERE sme_id = 1');
 
                 for (const row of results) {
@@ -34,20 +35,15 @@ app.post('/api/upload', upload.single('statement'), (req, res) => {
                     const amount = row.amount || row.Amount || 0;
                     const type = row.type || row.Type || 'DEBIT';
                     
-                    // AI Step (Safe Mode)
+                    // Run AI (with fallback)
                     let category = "Uncategorized";
-                    try {
-                         category = await categorizeTransaction(desc);
-                    } catch (e) {
-                         console.log("Skipping AI for row:", e.message);
-                    }
+                    try { category = await categorizeTransaction(desc); } catch (e) {}
                     
                     await db.query(
                         `INSERT INTO transactions (sme_id, transaction_date, amount, type, description, category) VALUES (?, NOW(), ?, ?, ?, ?)`,
                         [1, amount, type, desc, category]
                     );
                 }
-                
                 fs.unlinkSync(filePath); 
                 res.json({ message: "Success", success: true });
 
@@ -58,55 +54,79 @@ app.post('/api/upload', upload.single('statement'), (req, res) => {
         });
 });
 
-// 2. DASHBOARD ROUTE (With AI Insights Logic)
+// 2. DASHBOARD ROUTE (With Prediction & Loan Logic)
 app.get('/api/dashboard-data', async (req, res) => {
     try {
         const [transactions] = await db.query('SELECT * FROM transactions WHERE sme_id = 1 ORDER BY transaction_date DESC');
         
-        let score = 300;
+        let score = 500; 
         let totalIncome = 0;
         let totalExpense = 0;
-        let aiInsights = []; // <--- NEW LIST FOR REASONS
+        let aiInsights = [];
+        let incomeHistory = []; 
 
-        transactions.forEach(tx => {
+        transactions.forEach((tx) => {
             const amt = parseFloat(tx.amount);
             if (tx.type === 'CREDIT') {
                 totalIncome += amt;
+                incomeHistory.push(amt);
             } else {
                 totalExpense += amt;
                 
-                // RISK LOGIC
+                // Risk Logic
                 const cat = (tx.category || '').toLowerCase();
-                
                 if (cat.includes('gambling') || cat.includes('betting')) {
-                    score -= 50;
-                    // Prevent duplicate messages
+                    score -= 100;
                     if (!aiInsights.some(msg => msg.includes("Gambling"))) {
-                        aiInsights.push("High Risk: Gambling activity detected (-50 points).");
+                        aiInsights.push("⚠️ High Risk: Gambling activity detected (-100 pts).");
                     }
                 }
             }
         });
 
-        // CASH FLOW LOGIC
+        // Scoring Logic
         if (totalIncome > totalExpense) {
             score += 100;
-            aiInsights.push("Positive: Healthy Cash Flow (Income > Expenses).");
+            aiInsights.push("✅ Positive: Healthy Cash Flow (+100 pts).");
         } else {
-            aiInsights.push("Negative: High Burn Rate (Expenses > Income).");
+            score -= 50;
+            aiInsights.push("❌ Negative: Spending more than you earn (-50 pts).");
         }
 
-        // GROWTH LOGIC
-        if (transactions.length > 5) {
-            score += 50;
-            aiInsights.push("Positive: High Transaction Volume (+50 points).");
+        if (transactions.length > 5) score += 50;
+        if (totalIncome > 50000) {
+             score += 100;
+             aiInsights.push("✅ Positive: High Revenue Business (+100 pts).");
         }
-        
-        // Final Score Math
+
         score = Math.min(score, 850);
-        score = Math.max(score, 300); // Don't go below 300
+        score = Math.max(score, 300);
 
-        res.json({ score, transactions, summary: { totalIncome, totalExpense }, aiInsights });
+        // Feature 1: AI Prediction
+        let forecastMsg = "Insufficient data.";
+        if (incomeHistory.length >= 2) {
+            const trendData = incomeHistory.reverse().map((amt, i) => [i + 1, amt]);
+            const regressionLine = ss.linearRegression(trendData);
+            const growth = regressionLine.m > 0 ? "Growing 📈" : "Stable";
+            forecastMsg = `Revenue Trend: ${growth}`;
+        }
+
+        // Feature 2: Loan Matcher
+        let loanOffer = { amount: 0, status: "Locked" };
+        if (score >= 700) {
+            loanOffer = { amount: Math.round(totalIncome * 0.4), status: "Pre-Approved ✅" };
+        } else if (score >= 500) {
+            loanOffer = { amount: Math.round(totalIncome * 0.15), status: "Micro-Loan Only ⚠️" };
+        }
+
+        res.json({ 
+            score, 
+            transactions, 
+            summary: { totalIncome, totalExpense }, 
+            aiInsights,
+            prediction: { forecastMsg },
+            loanOffer
+        });
 
     } catch (error) {
         console.error("Dashboard Error:", error);
@@ -114,6 +134,7 @@ app.get('/api/dashboard-data', async (req, res) => {
     }
 });
 
+// START THE SERVER
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🚀 BiasharaScore Server running on http://localhost:${PORT}`);
